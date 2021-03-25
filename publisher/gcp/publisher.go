@@ -22,7 +22,7 @@ import (
 	"time"
 
 	"cloud.google.com/go/pubsub"
-	"gopkg.in/mgo.v2/bson"
+	"go.mongodb.org/mongo-driver/bson"
 
 	eh "github.com/looplab/eventhorizon"
 	"github.com/looplab/eventhorizon/publisher/local"
@@ -112,7 +112,7 @@ func NewEventPublisher(projectID, appID string) (*EventPublisher, error) {
 
 // PublishEvent implements the PublishEvent method of the eventhorizon.EventPublisher interface.
 func (b *EventPublisher) PublishEvent(ctx context.Context, event eh.Event) error {
-	gcpEvent := gcpEvent{
+	e := gcpEvent{
 		AggregateID:   event.AggregateID(),
 		AggregateType: event.AggregateType(),
 		EventType:     event.EventType(),
@@ -123,17 +123,15 @@ func (b *EventPublisher) PublishEvent(ctx context.Context, event eh.Event) error
 
 	// Marshal event data if there is any.
 	if event.Data() != nil {
-		rawData, err := bson.Marshal(event.Data())
-		if err != nil {
+		var err error
+		if e.RawData, err = bson.Marshal(event.Data()); err != nil {
 			return ErrCouldNotMarshalEvent
 		}
-		gcpEvent.RawData = bson.Raw{Kind: 3, Data: rawData}
 	}
 
 	// Marshal the event (using BSON for now).
-	var data []byte
-	var err error
-	if data, err = bson.Marshal(gcpEvent); err != nil {
+	data, err := bson.Marshal(e)
+	if err != nil {
 		return ErrCouldNotMarshalEvent
 	}
 
@@ -170,36 +168,36 @@ func (b *EventPublisher) Close() error {
 }
 
 func (b *EventPublisher) handleMessage(ctx context.Context, msg *pubsub.Message) {
-	// Manually decode the raw BSON event.
-	data := bson.Raw{
-		Kind: 3,
-		Data: msg.Data,
-	}
-	var gcpEvent gcpEvent
-	if err := data.Unmarshal(&gcpEvent); err != nil {
+	// Decode the raw BSON event data.
+	var e gcpEvent
+	if err := bson.Unmarshal(msg.Data, &e); err != nil {
 		msg.Nack()
 		// TODO: Also forward the real error.
 		b.errCh <- Error{Err: ErrCouldNotUnmarshalEvent}
 		return
 	}
 
-	// Create an event of the correct type.
-	if data, err := eh.CreateEventData(gcpEvent.EventType); err == nil {
-		// Manually decode the raw BSON event.
-		if err := gcpEvent.RawData.Unmarshal(data); err != nil {
+	// Create an event of the correct type and decode from raw BSON.
+	if len(e.RawData) > 0 {
+		var err error
+		if e.data, err = eh.CreateEventData(e.EventType); err != nil {
 			msg.Nack()
 			// TODO: Also forward the real error.
 			b.errCh <- Error{Err: ErrCouldNotUnmarshalEvent}
 			return
 		}
 
-		// Set concrete event and zero out the decoded event.
-		gcpEvent.data = data
-		gcpEvent.RawData = bson.Raw{}
+		if err := bson.Unmarshal(e.RawData, e.data); err != nil {
+			msg.Nack()
+			// TODO: Also forward the real error.
+			b.errCh <- Error{Err: ErrCouldNotUnmarshalEvent}
+			return
+		}
+		e.RawData = nil
 	}
 
-	event := event{gcpEvent: gcpEvent}
-	ctx = eh.UnmarshalContext(gcpEvent.Context)
+	event := event{gcpEvent: e}
+	ctx = eh.UnmarshalContext(e.Context)
 
 	// Notify all observers about the event.
 	if err := b.EventPublisher.PublishEvent(ctx, event); err != nil {

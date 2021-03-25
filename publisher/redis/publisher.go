@@ -19,12 +19,11 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"strings"
 	"time"
 
 	"github.com/garyburd/redigo/redis"
 	"github.com/jpillora/backoff"
-	"gopkg.in/mgo.v2/bson"
+	"go.mongodb.org/mongo-driver/bson"
 
 	eh "github.com/looplab/eventhorizon"
 	"github.com/looplab/eventhorizon/publisher/local"
@@ -111,15 +110,7 @@ func NewEventPublisherWithPool(appID string, pool *redis.Pool) (*EventPublisher,
 
 // PublishEvent publishes an event to all handlers capable of handling it.
 func (b *EventPublisher) PublishEvent(ctx context.Context, event eh.Event) error {
-	conn := b.pool.Get()
-	defer conn.Close()
-
-	if err := conn.Err(); err != nil {
-		return err
-	}
-
-	// Create the Redis event.
-	redisEvent := redisEvent{
+	e := redisEvent{
 		AggregateID:   event.AggregateID(),
 		AggregateType: event.AggregateType(),
 		EventType:     event.EventType(),
@@ -130,18 +121,23 @@ func (b *EventPublisher) PublishEvent(ctx context.Context, event eh.Event) error
 
 	// Marshal event data if there is any.
 	if event.Data() != nil {
-		rawData, err := bson.Marshal(event.Data())
-		if err != nil {
+		var err error
+		if e.RawData, err = bson.Marshal(event.Data()); err != nil {
 			return ErrCouldNotMarshalEvent
 		}
-		redisEvent.RawData = bson.Raw{Kind: 3, Data: rawData}
 	}
 
-	// Marshal the Redis event (using BSON for now).
-	var data []byte
-	var err error
-	if data, err = bson.Marshal(redisEvent); err != nil {
+	// Marshal the event (using BSON for now).
+	data, err := bson.Marshal(e)
+	if err != nil {
 		return ErrCouldNotMarshalEvent
+	}
+
+	conn := b.pool.Get()
+	defer conn.Close()
+
+	if err := conn.Err(); err != nil {
+		return err
 	}
 
 	// Publish all events on their own channel.
@@ -214,38 +210,30 @@ func (b *EventPublisher) recv(delay *backoff.Backoff) error {
 }
 
 func (b *EventPublisher) handleMessage(msg redis.PMessage) error {
-	// Manually decode the raw BSON event.
-	data := bson.Raw{
-		Kind: 3,
-		Data: msg.Data,
-	}
-	var redisEvent redisEvent
-	if err := data.Unmarshal(&redisEvent); err != nil {
+	// Decode the raw BSON event data.
+	var e redisEvent
+	if err := bson.Unmarshal(msg.Data, &e); err != nil {
 		// TODO: Forward the real error.
 		return ErrCouldNotUnmarshalEvent
 	}
 
-	// Extract the event type from the channel name.
-	eventType := eh.EventType(strings.TrimPrefix(msg.Channel, b.prefix))
-	if redisEvent.EventType != eventType {
-		return errors.New("event type mismatch")
-	}
-
-	// Create an event of the correct type.
-	if data, err := eh.CreateEventData(redisEvent.EventType); err == nil {
-		// Manually decode the raw BSON event.
-		if err := redisEvent.RawData.Unmarshal(data); err != nil {
+	// Create an event of the correct type and decode from raw BSON.
+	if len(e.RawData) > 0 {
+		var err error
+		if e.data, err = eh.CreateEventData(e.EventType); err != nil {
 			// TODO: Forward the real error.
 			return ErrCouldNotUnmarshalEvent
 		}
 
-		// Set concrete event and zero out the decoded event.
-		redisEvent.data = data
-		redisEvent.RawData = bson.Raw{}
+		if err := bson.Unmarshal(e.RawData, e.data); err != nil {
+			// TODO: Forward the real error.
+			return ErrCouldNotUnmarshalEvent
+		}
+		e.RawData = nil
 	}
 
-	event := event{redisEvent: redisEvent}
-	ctx := eh.UnmarshalContext(redisEvent.Context)
+	event := event{redisEvent: e}
+	ctx := eh.UnmarshalContext(e.Context)
 
 	// Notify all observers about the event.
 	return b.EventPublisher.PublishEvent(ctx, event)

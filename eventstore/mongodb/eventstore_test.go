@@ -29,8 +29,9 @@ func TestEventStore(t *testing.T) {
 	if addr == "" {
 		addr = "localhost:27017"
 	}
+	url := "mongodb://" + addr
 
-	store, err := NewEventStore(addr, "test")
+	store, err := NewEventStore(url, "", "", "test")
 	if err != nil {
 		t.Fatal("there should be no error:", err)
 	}

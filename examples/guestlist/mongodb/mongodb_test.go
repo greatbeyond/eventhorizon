@@ -39,9 +39,10 @@ func Example() {
 	if addr == "" {
 		addr = "localhost:27017"
 	}
+	url := "mongodb://" + addr
 
 	// Create the event store.
-	eventStore, err := eventstore.NewEventStore(addr, "demo")
+	eventStore, err := eventstore.NewEventStore(url, "", "", "demo")
 	if err != nil {
 		log.Fatalf("could not create event store: %s", err)
 	}
@@ -55,14 +56,14 @@ func Example() {
 	commandBus := bus.NewCommandHandler()
 
 	// Create the read repositories.
-	invitationRepo, err := repo.NewRepo(addr, "demo", "invitations")
+	invitationRepo, err := repo.NewRepo(url, "demo", "invitations")
 	if err != nil {
 		log.Fatalf("could not create invitation repository: %s", err)
 	}
 	invitationRepo.SetEntityFactory(func() eh.Entity { return &domain.Invitation{} })
 	// A version repo is needed for the projector to handle eventual consistency.
 	invitationVersionRepo := version.NewRepo(invitationRepo)
-	guestListRepo, err := repo.NewRepo(addr, "demo", "guest_lists")
+	guestListRepo, err := repo.NewRepo(url, "demo", "guest_lists")
 	if err != nil {
 		log.Fatalf("could not create guest list repository: %s", err)
 	}

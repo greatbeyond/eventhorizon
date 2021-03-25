@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Package mongodb is a eventhorizon event store for mongo db
 package mongodb
 
 import (
@@ -20,8 +21,11 @@ import (
 	"fmt"
 	"time"
 
-	"gopkg.in/mgo.v2"
-	"gopkg.in/mgo.v2/bson"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/mongo/readpref"
+	"go.mongodb.org/mongo-driver/mongo/writeconcern"
 
 	eh "github.com/looplab/eventhorizon"
 )
@@ -49,31 +53,38 @@ var ErrCouldNotSaveAggregate = errors.New("could not save aggregate")
 
 // EventStore implements an EventStore for MongoDB.
 type EventStore struct {
-	session  *mgo.Session
+	client   *mongo.Client
 	dbPrefix string
 }
 
-// NewEventStore creates a new EventStore.
-func NewEventStore(url, dbPrefix string) (*EventStore, error) {
-	session, err := mgo.Dial(url)
-	if err != nil {
-		return nil, ErrCouldNotDialDB
+// NewEventStore creates a new EventStore with a new mongo client connection.
+func NewEventStore(url, username, password, dbPrefix string) (*EventStore, error) {
+	opts := options.Client().ApplyURI(url)
+	opts.SetReadPreference(readpref.Primary())
+	opts.SetWriteConcern(writeconcern.New(writeconcern.WMajority()))
+	if username != "" {
+		opts.SetAuth(options.Credential{
+			Username: username,
+			Password: password,
+		})
 	}
 
-	session.SetMode(mgo.Strong, true)
-	session.SetSafe(&mgo.Safe{W: 1})
+	client, err := mongo.Connect(context.TODO(), opts)
+	if err != nil {
+		return nil, err
+	}
 
-	return NewEventStoreWithSession(session, dbPrefix)
+	return NewEventStoreWithClient(client, dbPrefix)
 }
 
-// NewEventStoreWithSession creates a new EventStore with a session.
-func NewEventStoreWithSession(session *mgo.Session, dbPrefix string) (*EventStore, error) {
-	if session == nil {
+// NewEventStoreWithClient creates a new EventStore with an existing mongo client.
+func NewEventStoreWithClient(client *mongo.Client, dbPrefix string) (*EventStore, error) {
+	if client == nil {
 		return nil, ErrNoDBSession
 	}
 
 	s := &EventStore{
-		session:  session,
+		client:   client,
 		dbPrefix: dbPrefix,
 	}
 
@@ -88,9 +99,6 @@ func (s *EventStore) Save(ctx context.Context, events []eh.Event, originalVersio
 			Namespace: eh.NamespaceFromContext(ctx),
 		}
 	}
-
-	sess := s.session.Copy()
-	defer sess.Close()
 
 	// Build all event records, with incrementing versions starting from the
 	// original aggregate version.
@@ -131,7 +139,7 @@ func (s *EventStore) Save(ctx context.Context, events []eh.Event, originalVersio
 			Events:      dbEvents,
 		}
 
-		if err := sess.DB(s.dbName(ctx)).C("events").Insert(aggregate); err != nil {
+		if _, err := s.client.Database(s.dbName(ctx)).Collection("events").InsertOne(ctx, aggregate); err != nil {
 			return eh.EventStoreError{
 				BaseErr:   err,
 				Err:       ErrCouldNotSaveAggregate,
@@ -142,7 +150,8 @@ func (s *EventStore) Save(ctx context.Context, events []eh.Event, originalVersio
 		// Increment aggregate version on insert of new event record, and
 		// only insert if version of aggregate is matching (ie not changed
 		// since loading the aggregate).
-		if err := sess.DB(s.dbName(ctx)).C("events").Update(
+		if r, err := s.client.Database(s.dbName(ctx)).Collection("events").UpdateOne(
+			ctx,
 			bson.M{
 				"_id":     aggregateID.String(),
 				"version": originalVersion,
@@ -157,6 +166,12 @@ func (s *EventStore) Save(ctx context.Context, events []eh.Event, originalVersio
 				Err:       ErrCouldNotSaveAggregate,
 				Namespace: eh.NamespaceFromContext(ctx),
 			}
+		} else if r.ModifiedCount == 0 {
+			return eh.EventStoreError{
+				BaseErr:   fmt.Errorf("unable to update eventstore document"),
+				Err:       ErrCouldNotSaveAggregate,
+				Namespace: eh.NamespaceFromContext(ctx),
+			}
 		}
 	}
 
@@ -165,12 +180,14 @@ func (s *EventStore) Save(ctx context.Context, events []eh.Event, originalVersio
 
 // Load implements the Load method of the eventhorizon.EventStore interface.
 func (s *EventStore) Load(ctx context.Context, id eh.UUID) ([]eh.Event, error) {
-	sess := s.session.Copy()
-	defer sess.Close()
-
 	var aggregate aggregateRecord
-	err := sess.DB(s.dbName(ctx)).C("events").FindId(id.String()).One(&aggregate)
-	if err == mgo.ErrNotFound {
+	err := s.client.Database(s.dbName(ctx)).Collection("events").FindOne(
+		ctx,
+		bson.M{
+			"_id": id.String(),
+		},
+	).Decode(&aggregate)
+	if err == mongo.ErrNoDocuments {
 		return []eh.Event{}, nil
 	} else if err != nil {
 		return nil, eh.EventStoreError{
@@ -184,16 +201,19 @@ func (s *EventStore) Load(ctx context.Context, id eh.UUID) ([]eh.Event, error) {
 	for i, dbEvent := range aggregate.Events {
 		// Create an event of the correct type.
 		if data, err := eh.CreateEventData(dbEvent.EventType); err == nil {
-			// Manually decode the raw BSON event.
-			if err := dbEvent.RawData.Unmarshal(data); err != nil {
-				return nil, eh.EventStoreError{
-					BaseErr:   err,
-					Err:       ErrCouldNotUnmarshalEvent,
-					Namespace: eh.NamespaceFromContext(ctx),
+			// Only decode if there is actual data in the event
+			if dbEvent.RawData != nil {
+				// Manually decode the raw BSON event.
+				if err := bson.Unmarshal(dbEvent.RawData, data); err != nil {
+					return nil, eh.EventStoreError{
+						BaseErr:   err,
+						Err:       ErrCouldNotUnmarshalEvent,
+						Namespace: eh.NamespaceFromContext(ctx),
+					}
 				}
 			}
 
-			// Set conrcete event and zero out the decoded event.
+			// Set concrete event and zero out the decoded event.
 			dbEvent.data = data
 			dbEvent.RawData = bson.Raw{}
 		}
@@ -206,12 +226,14 @@ func (s *EventStore) Load(ctx context.Context, id eh.UUID) ([]eh.Event, error) {
 
 // Replace implements the Replace method of the eventhorizon.EventStore interface.
 func (s *EventStore) Replace(ctx context.Context, event eh.Event) error {
-	sess := s.session.Copy()
-	defer sess.Close()
-
 	// First check if the aggregate exists, the not found error in the update
 	// query can mean both that the aggregate or the event is not found.
-	n, err := sess.DB(s.dbName(ctx)).C("events").FindId(event.AggregateID().String()).Count()
+	n, err := s.client.Database(s.dbName(ctx)).Collection("events").CountDocuments(
+		ctx,
+		bson.M{
+			"_id": event.AggregateID().String(),
+		},
+	)
 	if n == 0 {
 		return eh.ErrAggregateNotFound
 	} else if err != nil {
@@ -229,7 +251,8 @@ func (s *EventStore) Replace(ctx context.Context, event eh.Event) error {
 	}
 
 	// Find and replace the event.
-	err = sess.DB(s.dbName(ctx)).C("events").Update(
+	if r, err := s.client.Database(s.dbName(ctx)).Collection("events").UpdateOne(
+		ctx,
 		bson.M{
 			"_id":            event.AggregateID().String(),
 			"events.version": event.Version(),
@@ -237,15 +260,14 @@ func (s *EventStore) Replace(ctx context.Context, event eh.Event) error {
 		bson.M{
 			"$set": bson.M{"events.$": *e},
 		},
-	)
-	if err == mgo.ErrNotFound {
-		return eh.ErrInvalidEvent
-	} else if err != nil {
+	); err != nil {
 		return eh.EventStoreError{
 			BaseErr:   err,
 			Err:       ErrCouldNotSaveAggregate,
 			Namespace: eh.NamespaceFromContext(ctx),
 		}
+	} else if r.ModifiedCount == 0 {
+		return eh.ErrInvalidEvent
 	}
 
 	return nil
@@ -253,12 +275,10 @@ func (s *EventStore) Replace(ctx context.Context, event eh.Event) error {
 
 // RenameEvent implements the RenameEvent method of the eventhorizon.EventStore interface.
 func (s *EventStore) RenameEvent(ctx context.Context, from, to eh.EventType) error {
-	sess := s.session.Copy()
-	defer sess.Close()
-
 	// Find and rename all events.
 	// TODO: Maybe use change info.
-	if _, err := sess.DB(s.dbName(ctx)).C("events").UpdateAll(
+	if _, err := s.client.Database(s.dbName(ctx)).Collection("events").UpdateMany(
+		ctx,
 		bson.M{
 			"events.event_type": string(from),
 		},
@@ -278,7 +298,7 @@ func (s *EventStore) RenameEvent(ctx context.Context, from, to eh.EventType) err
 
 // Clear clears the event storage.
 func (s *EventStore) Clear(ctx context.Context) error {
-	if err := s.session.DB(s.dbName(ctx)).C("events").DropCollection(); err != nil {
+	if err := s.client.Database(s.dbName(ctx)).Collection("events").Drop(ctx); err != nil {
 		return eh.EventStoreError{
 			BaseErr:   err,
 			Err:       ErrCouldNotClearDB,
@@ -289,9 +309,7 @@ func (s *EventStore) Clear(ctx context.Context) error {
 }
 
 // Close closes the database session.
-func (s *EventStore) Close() {
-	s.session.Close()
-}
+func (s *EventStore) Close() {}
 
 // dbName appends the namespace, if one is set, to the DB prefix to
 // get the name of the DB to use.
@@ -334,7 +352,8 @@ func newDBEvent(ctx context.Context, event eh.Event) (*dbEvent, error) {
 				Namespace: eh.NamespaceFromContext(ctx),
 			}
 		}
-		rawData = bson.Raw{Kind: 3, Data: raw}
+
+		rawData = raw
 	}
 
 	return &dbEvent{

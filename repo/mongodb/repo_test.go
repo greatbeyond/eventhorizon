@@ -21,8 +21,8 @@ import (
 	"testing"
 	"time"
 
-	"gopkg.in/mgo.v2"
-	"gopkg.in/mgo.v2/bson"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
 
 	eh "github.com/looplab/eventhorizon"
 	"github.com/looplab/eventhorizon/mocks"
@@ -35,8 +35,9 @@ func TestReadRepo(t *testing.T) {
 	if addr == "" {
 		addr = "localhost:27017"
 	}
+	url := "mongodb://" + addr
 
-	repo, err := NewRepo(addr, "test", "mocks.Model")
+	repo, err := NewRepo(url, "test", "mocks.Model")
 	if err != nil {
 		t.Error("there should be no error:", err)
 	}
@@ -79,15 +80,15 @@ func extraRepoTests(t *testing.T, ctx context.Context, repo *Repo) {
 	modelCustom := &mocks.Model{
 		ID:        eh.NewUUID(),
 		Content:   "modelCustom",
-		CreatedAt: time.Now().Round(time.Millisecond),
+		CreatedAt: time.Now().UTC().Round(time.Millisecond),
 	}
 	if err := repo.Save(ctx, modelCustom); err != nil {
 		t.Error("there should be no error:", err)
 	}
 
 	// FindCustom by content.
-	result, err := repo.FindCustom(ctx, func(c *mgo.Collection) *mgo.Query {
-		return c.Find(bson.M{"content": "modelCustom"})
+	result, err := repo.FindCustom(ctx, func(c *mongo.Collection) (*mongo.Cursor, error) {
+		return c.Find(ctx, bson.M{"content": "modelCustom"})
 	})
 	if len(result) != 1 {
 		t.Error("there should be one item:", len(result))
@@ -97,22 +98,22 @@ func extraRepoTests(t *testing.T, ctx context.Context, repo *Repo) {
 	}
 
 	// FindCustom with no query.
-	result, err = repo.FindCustom(ctx, func(c *mgo.Collection) *mgo.Query {
-		return nil
+	_, err = repo.FindCustom(ctx, func(c *mongo.Collection) (*mongo.Cursor, error) {
+		return nil, nil
 	})
 	if rrErr, ok := err.(eh.RepoError); !ok || rrErr.Err != ErrInvalidQuery {
 		t.Error("there should be a invalid query error:", err)
 	}
 
-	count := 0
+	var count int64
 	// FindCustom with query execution in the callback.
-	_, err = repo.FindCustom(ctx, func(c *mgo.Collection) *mgo.Query {
-		if count, err = c.Count(); err != nil {
+	_, err = repo.FindCustom(ctx, func(c *mongo.Collection) (*mongo.Cursor, error) {
+		if count, err = c.CountDocuments(ctx, bson.M{}); err != nil {
 			t.Error("there should be no error:", err)
 		}
 
 		// Be sure to return nil to not execute the query again in FindCustom.
-		return nil
+		return nil, nil
 	})
 	if rrErr, ok := err.(eh.RepoError); !ok || rrErr.Err != ErrInvalidQuery {
 		t.Error("there should be a invalid query error:", err)
@@ -125,8 +126,9 @@ func extraRepoTests(t *testing.T, ctx context.Context, repo *Repo) {
 		ID:      eh.NewUUID(),
 		Content: "modelCustom2",
 	}
-	if err := repo.Collection(ctx, func(c *mgo.Collection) error {
-		return c.Insert(modelCustom2)
+	if err := repo.Collection(ctx, func(c *mongo.Collection) error {
+		_, err := c.InsertOne(ctx, modelCustom2)
+		return err
 	}); err != nil {
 		t.Error("there should be no error:", err)
 	}
@@ -139,8 +141,8 @@ func extraRepoTests(t *testing.T, ctx context.Context, repo *Repo) {
 	}
 
 	// FindCustomIter by content.
-	iter, err := repo.FindCustomIter(ctx, func(c *mgo.Collection) *mgo.Query {
-		return c.Find(bson.M{"content": "modelCustom"})
+	iter, err := repo.FindCustomIter(ctx, func(c *mongo.Collection) (*mongo.Cursor, error) {
+		return c.Find(ctx, bson.M{"content": "modelCustom"})
 	})
 	if err != nil {
 		t.Error("there should be no error:", err)
@@ -177,8 +179,9 @@ func TestRepository(t *testing.T) {
 	if addr == "" {
 		addr = "localhost:27017"
 	}
+	url := "mongodb://" + addr
 
-	repo, err := NewRepo(addr, "test", "mocks.Model")
+	repo, err := NewRepo(url, "test", "mocks.Model")
 	if err != nil {
 		t.Error("there should be no error:", err)
 	}

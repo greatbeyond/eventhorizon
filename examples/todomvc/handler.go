@@ -61,9 +61,10 @@ func NewHandler() (*Handler, error) {
 	if addr == "" {
 		addr = "localhost:27017"
 	}
+	dbURL := "mongodb://" + addr
 
 	// Create the event store.
-	eventStore, err := eventstore.NewEventStore(addr, "todomvc")
+	eventStore, err := eventstore.NewEventStore(dbURL, "", "", "todomvc")
 	if err != nil {
 		return nil, fmt.Errorf("could not create event store: %s", err)
 	}
@@ -93,7 +94,7 @@ func NewHandler() (*Handler, error) {
 	})
 
 	// Create the repository and wrap in a version repository.
-	repo, err := repo.NewRepo(addr, "todomvc", "todos")
+	repo, err := repo.NewRepo(dbURL, "todomvc", "todos")
 	if err != nil {
 		return nil, fmt.Errorf("could not create invitation repository: %s", err)
 	}
