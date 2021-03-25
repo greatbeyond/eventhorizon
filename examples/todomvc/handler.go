@@ -56,16 +56,14 @@ func (l *Logger) Notify(ctx context.Context, event eh.Event) {
 // NewHandler sets up the full Event Horizon domain for the TodoMVC app and
 // returns a handler exposing some of the components.
 func NewHandler() (*Handler, error) {
-	host := os.Getenv("MONGO_PORT_27017_TCP_ADDR")
-	port := os.Getenv("MONGO_PORT_27017_TCP_PORT")
-
-	dbURL := "localhost"
-	if host != "" && port != "" {
-		dbURL = host + ":" + port
+	// Use MongoDB in Docker with fallback to localhost.
+	addr := os.Getenv("MONGODB_ADDR")
+	if addr == "" {
+		addr = "localhost:27017"
 	}
 
 	// Create the event store.
-	eventStore, err := eventstore.NewEventStore(dbURL, "todomvc")
+	eventStore, err := eventstore.NewEventStore(addr, "todomvc")
 	if err != nil {
 		return nil, fmt.Errorf("could not create event store: %s", err)
 	}
@@ -95,7 +93,7 @@ func NewHandler() (*Handler, error) {
 	})
 
 	// Create the repository and wrap in a version repository.
-	repo, err := repo.NewRepo(dbURL, "todomvc", "todos")
+	repo, err := repo.NewRepo(addr, "todomvc", "todos")
 	if err != nil {
 		return nil, fmt.Errorf("could not create invitation repository: %s", err)
 	}

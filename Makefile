@@ -1,30 +1,31 @@
-.PHONEY: cover clean
+.PHONEY: test
+test:
+	go test ./...
 
-test: run_services
-	PUBSUB_EMULATOR_HOST=localhost:8793 go test $$(go list ./... | grep -v /vendor/)
+.PHONEY: test_integration
+test_integration:
+	go test -tags integration ./...
 
-test_integration: run_services
-	go test -tags integration $$(go list ./... | grep -v /vendor/)
+.PHONY: run
+run:
+	docker-compose up -d mongodb gpubsub redis
 
-test_cover: clean run_services
-	go list -f '{{if len .TestGoFiles}}"PUBSUB_EMULATOR_HOST=localhost:8793 go test -v -covermode=count -coverprofile={{.Dir}}/.coverprofile {{.ImportPath}}"{{end}}' $$(go list ./... | grep -v /vendor/) | xargs -L 1 sh -c
-	gover
+.PHONY: run_mongodb
+run_mongodb:
+	docker-compose up -d mongodb
 
-cover:
-	go tool cover -html=gover.coverprofile
+.PHONY: run_gpubsub
+run_gpubsub:
+	docker-compose up -d gpubsub
 
-run_services:
-	-docker run -d --name mongo -p 27017:27017 mongo:latest
-	-docker run -d --name redis -p 6379:6379 redis:latest
-	-docker run -d --name dynamodb -p 8000:8000 peopleperhour/dynamodb:latest
-	-docker run -d --name gpubsub -p 8793:8793 google/cloud-sdk:latest gcloud beta emulators pubsub start --host-port=0.0.0.0:8793
+.PHONY: run_redis
+run_redis:
+	docker-compose up -d redis
 
-update_services:
-	docker pull mongo:latest
-	docker pull redis:latest
-	docker pull peopleperhour/dynamodb:latest
-	docker pull google/cloud-sdk:latest
+.PHONY: stop
+stop:
+	docker-compose down
 
-clean:
-	-find . -name \.coverprofile -type f -delete
-	-rm gover.coverprofile
+.PHONY: mongodb_shell
+mongodb_shell:
+	docker run -it --network eventhorizon_default --rm mongo:4.4 mongo --host mongodb test

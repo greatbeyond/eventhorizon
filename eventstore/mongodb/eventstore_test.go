@@ -24,15 +24,13 @@ import (
 )
 
 func TestEventStore(t *testing.T) {
-	host := os.Getenv("MONGO_PORT_27017_TCP_ADDR")
-	port := os.Getenv("MONGO_PORT_27017_TCP_PORT")
-
-	url := "localhost"
-	if host != "" && port != "" {
-		url = host + ":" + port
+	// Use MongoDB in Docker with fallback to localhost.
+	addr := os.Getenv("MONGODB_ADDR")
+	if addr == "" {
+		addr = "localhost:27017"
 	}
 
-	store, err := NewEventStore(url, "test")
+	store, err := NewEventStore(addr, "test")
 	if err != nil {
 		t.Fatal("there should be no error:", err)
 	}

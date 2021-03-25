@@ -34,16 +34,14 @@ import (
 )
 
 func Example() {
-	host := os.Getenv("MONGO_PORT_27017_TCP_ADDR")
-	port := os.Getenv("MONGO_PORT_27017_TCP_PORT")
-
-	url := "localhost"
-	if host != "" && port != "" {
-		url = host + ":" + port
+	// Use MongoDB in Docker with fallback to localhost.
+	addr := os.Getenv("MONGODB_ADDR")
+	if addr == "" {
+		addr = "localhost:27017"
 	}
 
 	// Create the event store.
-	eventStore, err := eventstore.NewEventStore(url, "demo")
+	eventStore, err := eventstore.NewEventStore(addr, "demo")
 	if err != nil {
 		log.Fatalf("could not create event store: %s", err)
 	}
@@ -57,14 +55,14 @@ func Example() {
 	commandBus := bus.NewCommandHandler()
 
 	// Create the read repositories.
-	invitationRepo, err := repo.NewRepo(url, "demo", "invitations")
+	invitationRepo, err := repo.NewRepo(addr, "demo", "invitations")
 	if err != nil {
 		log.Fatalf("could not create invitation repository: %s", err)
 	}
 	invitationRepo.SetEntityFactory(func() eh.Entity { return &domain.Invitation{} })
 	// A version repo is needed for the projector to handle eventual consistency.
 	invitationVersionRepo := version.NewRepo(invitationRepo)
-	guestListRepo, err := repo.NewRepo(url, "demo", "guest_lists")
+	guestListRepo, err := repo.NewRepo(addr, "demo", "guest_lists")
 	if err != nil {
 		log.Fatalf("could not create guest list repository: %s", err)
 	}

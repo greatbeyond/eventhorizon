@@ -30,15 +30,13 @@ import (
 )
 
 func TestReadRepo(t *testing.T) {
-	host := os.Getenv("MONGO_PORT_27017_TCP_ADDR")
-	port := os.Getenv("MONGO_PORT_27017_TCP_PORT")
-
-	url := "localhost"
-	if host != "" && port != "" {
-		url = host + ":" + port
+	// Use MongoDB in Docker with fallback to localhost.
+	addr := os.Getenv("MONGODB_ADDR")
+	if addr == "" {
+		addr = "localhost:27017"
 	}
 
-	repo, err := NewRepo(url, "test", "mocks.Model")
+	repo, err := NewRepo(addr, "test", "mocks.Model")
 	if err != nil {
 		t.Error("there should be no error:", err)
 	}
@@ -174,15 +172,13 @@ func TestRepository(t *testing.T) {
 		t.Error("the parent repository should be nil:", r)
 	}
 
-	host := os.Getenv("MONGO_PORT_27017_TCP_ADDR")
-	port := os.Getenv("MONGO_PORT_27017_TCP_PORT")
-
-	url := "localhost"
-	if host != "" && port != "" {
-		url = host + ":" + port
+	// Use MongoDB in Docker with fallback to localhost.
+	addr := os.Getenv("MONGODB_ADDR")
+	if addr == "" {
+		addr = "localhost:27017"
 	}
 
-	repo, err := NewRepo(url, "test", "mocks.Model")
+	repo, err := NewRepo(addr, "test", "mocks.Model")
 	if err != nil {
 		t.Error("there should be no error:", err)
 	}

@@ -22,22 +22,20 @@ import (
 )
 
 func TestEventPublisher(t *testing.T) {
-	host := os.Getenv("REDIS_PORT_6379_TCP_ADDR")
-	port := os.Getenv("REDIS_PORT_6379_TCP_PORT")
-
-	url := ":6379"
-	if host != "" && port != "" {
-		url = host + ":" + port
+	// Connect to localhost if not running inside docker
+	addr := os.Getenv("REDIS_ADDR")
+	if addr == "" {
+		addr = "localhost:6379"
 	}
 
-	publisher1, err := NewEventPublisher("test", url, "")
+	publisher1, err := NewEventPublisher("test", addr, "")
 	if err != nil {
 		t.Fatal("there should be no error:", err)
 	}
 	defer publisher1.Close()
 
 	// Another bus to test the observer.
-	publisher2, err := NewEventPublisher("test", url, "")
+	publisher2, err := NewEventPublisher("test", addr, "")
 	if err != nil {
 		t.Fatal("there should be no error:", err)
 	}

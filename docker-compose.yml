@@ -1,0 +1,24 @@
+version: "3.4"
+
+services:
+  mongodb:
+    image: mongo:4.2
+    ports:
+      - "27017:27017"
+
+  gpubsub:
+    image: gcr.io/google.com/cloudsdktool/cloud-sdk:328.0.0-emulators
+    ports:
+      - "8793:8793"
+    entrypoint:
+      - gcloud
+      - beta
+      - emulators
+      - pubsub
+      - start
+      - "--host-port=0.0.0.0:8793"
+
+  redis:
+    image: redis:6.2-alpine3.13
+    ports:
+      - "6379:6379"
