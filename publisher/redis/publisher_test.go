@@ -22,7 +22,6 @@ import (
 )
 
 func TestEventPublisher(t *testing.T) {
-	// Support Wercker testing with MongoDB.
 	host := os.Getenv("REDIS_PORT_6379_TCP_ADDR")
 	port := os.Getenv("REDIS_PORT_6379_TCP_PORT")
 

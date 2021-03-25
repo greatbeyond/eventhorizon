@@ -30,7 +30,6 @@ import (
 )
 
 func TestReadRepo(t *testing.T) {
-	// Support Wercker testing with MongoDB.
 	host := os.Getenv("MONGO_PORT_27017_TCP_ADDR")
 	port := os.Getenv("MONGO_PORT_27017_TCP_PORT")
 
@@ -175,7 +174,6 @@ func TestRepository(t *testing.T) {
 		t.Error("the parent repository should be nil:", r)
 	}
 
-	// Support Wercker testing with MongoDB.
 	host := os.Getenv("MONGO_PORT_27017_TCP_ADDR")
 	port := os.Getenv("MONGO_PORT_27017_TCP_PORT")
 

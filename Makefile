@@ -6,9 +6,6 @@ test: run_services
 test_integration: run_services
 	go test -tags integration $$(go list ./... | grep -v /vendor/)
 
-test_wercker:
-	wercker build
-
 test_cover: clean run_services
 	go list -f '{{if len .TestGoFiles}}"PUBSUB_EMULATOR_HOST=localhost:8793 go test -v -covermode=count -coverprofile={{.Dir}}/.coverprofile {{.ImportPath}}"{{end}}' $$(go list ./... | grep -v /vendor/) | xargs -L 1 sh -c
 	gover

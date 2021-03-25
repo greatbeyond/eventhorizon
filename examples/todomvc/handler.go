@@ -56,7 +56,6 @@ func (l *Logger) Notify(ctx context.Context, event eh.Event) {
 // NewHandler sets up the full Event Horizon domain for the TodoMVC app and
 // returns a handler exposing some of the components.
 func NewHandler() (*Handler, error) {
-	// Support Wercker testing with MongoDB.
 	host := os.Getenv("MONGO_PORT_27017_TCP_ADDR")
 	port := os.Getenv("MONGO_PORT_27017_TCP_PORT")
 

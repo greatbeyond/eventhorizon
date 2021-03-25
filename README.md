@@ -1,8 +1,6 @@
-[![wercker status](https://app.wercker.com/status/a696ceaee4d3fc70f9cc505d002d633d/s "wercker status")](https://app.wercker.com/project/bykey/a696ceaee4d3fc70f9cc505d002d633d)
 [![Coverage Status](https://img.shields.io/coveralls/looplab/eventhorizon.svg)](https://coveralls.io/r/looplab/eventhorizon)
 [![GoDoc](https://godoc.org/github.com/looplab/eventhorizon?status.svg)](https://godoc.org/github.com/looplab/eventhorizon)
 [![Go Report Card](https://goreportcard.com/badge/looplab/eventhorizon)](https://goreportcard.com/report/looplab/eventhorizon)
-
 
 # Event Horizon
 
@@ -31,11 +29,9 @@ Inspired by the following libraries/examples:
 
 Suggestions are welcome!
 
-
 # Usage
 
 See the example folder for a basic usage example to get you started.
-
 
 # Storage and messaging implementations
 
@@ -45,11 +41,9 @@ In addition there is MongoDB implementations of the event store and a simple rea
 
 There is also experimental support for AWS DynamoDB as an event store. Support for a event bus using AWS SQS is also planned but not started.
 
-
 # Get Involved
 
 - Join our [slack channel](https://gophers.slack.com/messages/eventhorizon/) (sign up [here](https://gophersinvite.herokuapp.com/))
-
 
 # License
 
