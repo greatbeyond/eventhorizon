@@ -15,8 +15,11 @@
 package gcp
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/looplab/eventhorizon/publisher/testutil"
 )
@@ -27,21 +30,25 @@ func TestEventBus(t *testing.T) {
 		os.Setenv("PUBSUB_EMULATOR_HOST", "localhost:8793")
 	}
 
-	publisher1, err := NewEventPublisher("project_id", "test")
-	if err != nil {
-		t.Fatal("there should be no error:", err)
+	// Get a random app ID.
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		t.Fatal(err)
 	}
-	defer publisher1.Close()
+	appID := "app-" + hex.EncodeToString(b)
 
-	publisher2, err := NewEventPublisher("project_id", "test")
+	publisher1, err := NewEventPublisher("project_id", appID, "client1")
 	if err != nil {
 		t.Fatal("there should be no error:", err)
 	}
-	defer publisher2.Close()
+
+	publisher2, err := NewEventPublisher("project_id", appID, "client2")
+	if err != nil {
+		t.Fatal("there should be no error:", err)
+	}
 
 	// Wait for subscriptions to be ready.
-	<-publisher1.ready
-	<-publisher2.ready
+	time.Sleep(time.Second)
 
 	testutil.EventPublisherCommonTests(t, publisher1, publisher2)
 }

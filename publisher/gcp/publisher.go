@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Package gco is a eventhorizon event publisher for GCP
 package gcp
 
 import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"time"
 
 	"cloud.google.com/go/pubsub"
@@ -41,14 +41,13 @@ type EventPublisher struct {
 
 	client *pubsub.Client
 	topic  *pubsub.Topic
-	ready  chan bool // NOTE: Used for testing only
-	exit   chan bool
-	errCh  chan Error
+	errCh  chan error
 }
 
 // NewEventPublisher creates a EventPublisher.
-func NewEventPublisher(projectID, appID string) (*EventPublisher, error) {
+func NewEventPublisher(projectID, appID, subscriberID string) (*EventPublisher, error) {
 	ctx := context.Background()
+
 	client, err := pubsub.NewClient(ctx, projectID)
 	if err != nil {
 		return nil, err
@@ -65,45 +64,36 @@ func NewEventPublisher(projectID, appID string) (*EventPublisher, error) {
 		}
 	}
 
-	// Create the subscription, it should not exist as we use a new UUID as name.
-	id := "subscriber_" + eh.NewUUID().String()
-	sub, err := client.CreateSubscription(context.Background(), id,
-		pubsub.SubscriptionConfig{
-			Topic:       topic,
-			AckDeadline: 10 * time.Second,
-		},
-	)
-	if err != nil {
+	// Get or create the subscription.
+	subscriptionID := appID + "_" + subscriberID
+	sub := client.Subscription(subscriptionID)
+	if ok, err := sub.Exists(ctx); err != nil {
 		return nil, err
+	} else if !ok {
+		if sub, err = client.CreateSubscription(ctx, subscriptionID,
+			pubsub.SubscriptionConfig{
+				Topic: topic,
+			},
+		); err != nil {
+			return nil, err
+		}
 	}
 
 	b := &EventPublisher{
 		EventPublisher: local.NewEventPublisher(),
 		client:         client,
 		topic:          topic,
-		ready:          make(chan bool, 1), // Buffered to not block receive loop. Used in testing only!
-		exit:           make(chan bool),
-		errCh:          make(chan Error, 20),
+		errCh:          make(chan error, 20),
 	}
 
 	go func() {
-		<-b.exit
-		if err := sub.Delete(context.Background()); err != nil {
-			log.Println("eventpublisher: could not delete subscription:", err)
-		}
-		close(b.exit)
-	}()
-
-	go func() {
-		// Don't block if no one is receiving and buffer is full.
-		// NOTE: Used in testing only.
-		select {
-		case b.ready <- true:
-		default:
-		}
-
-		if err := sub.Receive(context.Background(), b.handleMessage); err != context.Canceled {
-			b.errCh <- Error{Err: errors.New("could not receive: " + err.Error())}
+		for {
+			if err := sub.Receive(ctx, b.handleMessage); err != context.Canceled {
+				select {
+				case b.errCh <- Error{Err: errors.New("could not receive"), BaseErr: err}:
+				default:
+				}
+			}
 		}
 	}()
 
@@ -135,62 +125,48 @@ func (b *EventPublisher) PublishEvent(ctx context.Context, event eh.Event) error
 		return ErrCouldNotMarshalEvent
 	}
 
-	// NOTE: Using a new context here.
-	var results []*pubsub.PublishResult
-	r := b.topic.Publish(context.Background(), &pubsub.Message{
+	r := b.topic.Publish(ctx, &pubsub.Message{
 		Data: data,
 	})
-
-	results = append(results, r)
-	for _, r := range results {
-		id, err := r.Get(ctx)
-		if err != nil {
-			return err
-		}
-
-		// TODO: Use the message ID to avoid handling duplicate messages.
-		_ = id
+	if _, err := r.Get(ctx); err != nil {
+		return err
 	}
 
 	return nil
 }
 
-// Close exits the receive goroutine by unsubscribing to all channels.
-func (b *EventPublisher) Close() error {
-	select {
-	case b.exit <- true:
-	default:
-		log.Println("eventpublisher: already closed")
-	}
-	<-b.exit
-
-	return b.topic.Delete(context.Background())
-}
-
 func (b *EventPublisher) handleMessage(ctx context.Context, msg *pubsub.Message) {
-	// Decode the raw BSON event data.
+	// Ack directly after receiving the event to avoid getting retries.
+	// TODO: Figure out when to best ack/nack a message.
+	msg.Ack()
+
+	// Manually decode the raw BSON event.
 	var e gcpEvent
 	if err := bson.Unmarshal(msg.Data, &e); err != nil {
-		msg.Nack()
-		// TODO: Also forward the real error.
-		b.errCh <- Error{Err: ErrCouldNotUnmarshalEvent}
+		select {
+		case b.errCh <- Error{Err: ErrCouldNotUnmarshalEvent, BaseErr: err}:
+		default:
+		}
 		return
 	}
 
-	// Create an event of the correct type and decode from raw BSON.
+	// Unmarshal event data with correct type, if there is data.
 	if len(e.RawData) > 0 {
 		var err error
-		if e.data, err = eh.CreateEventData(e.EventType); err != nil {
-			msg.Nack()
-			// TODO: Also forward the real error.
-			b.errCh <- Error{Err: ErrCouldNotUnmarshalEvent}
+		e.data, err = eh.CreateEventData(e.EventType)
+		if err != nil {
+			select {
+			case b.errCh <- Error{Err: ErrCouldNotUnmarshalEvent, BaseErr: fmt.Errorf("%s: %s, %s, %s", err.Error(), e.AggregateType, e.EventType, e.AggregateID)}:
+			default:
+			}
 			return
 		}
 
 		if err := bson.Unmarshal(e.RawData, e.data); err != nil {
-			msg.Nack()
-			// TODO: Also forward the real error.
-			b.errCh <- Error{Err: ErrCouldNotUnmarshalEvent}
+			select {
+			case b.errCh <- Error{Err: ErrCouldNotUnmarshalEvent, BaseErr: fmt.Errorf("%s: %s, %s, %s", err.Error(), e.AggregateType, e.EventType, e.AggregateID)}:
+			default:
+			}
 			return
 		}
 		e.RawData = nil
@@ -201,29 +177,33 @@ func (b *EventPublisher) handleMessage(ctx context.Context, msg *pubsub.Message)
 
 	// Notify all observers about the event.
 	if err := b.EventPublisher.PublishEvent(ctx, event); err != nil {
-		msg.Nack()
-		b.errCh <- Error{Ctx: ctx, Err: err, Event: event}
-		return
+		// Try to publish the error (currently there exist no errors at all).
+		select {
+		case b.errCh <- Error{Ctx: ctx, Err: err, Event: event}:
+		default:
+		}
 	}
-
-	msg.Ack()
 }
 
 // Errors returns an error channel where async handling errors are sent.
-func (b *EventPublisher) Errors() <-chan Error {
+func (b *EventPublisher) Errors() <-chan error {
 	return b.errCh
 }
 
 // Error is an async error containing the error and the event.
 type Error struct {
-	Err   error
-	Ctx   context.Context
-	Event eh.Event
+	Err     error
+	BaseErr error
+	Ctx     context.Context
+	Event   eh.Event
 }
 
 // Error implements the Error method of the error interface.
 func (e Error) Error() string {
-	return fmt.Sprintf("%s: %s", e.Event.String(), e.Err.Error())
+	if e.Event != nil {
+		return fmt.Sprintf("%s: %s (%s)", e.Event.String(), e.Err, e.BaseErr)
+	}
+	return fmt.Sprintf("%s (%s)", e.Err, e.BaseErr)
 }
 
 // gcpEvent is the internal event used with the gcp event bus.
