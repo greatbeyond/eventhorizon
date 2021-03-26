@@ -15,8 +15,11 @@
 package redis
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/looplab/eventhorizon/publisher/testutil"
 )
@@ -28,22 +31,26 @@ func TestEventPublisher(t *testing.T) {
 		addr = "localhost:6379"
 	}
 
-	publisher1, err := NewEventPublisher("test", addr, "")
+	// Get a random app ID.
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		t.Fatal(err)
+	}
+	appID := "app-" + hex.EncodeToString(b)
+
+	publisher1, err := NewEventPublisher(addr, appID, "client1")
 	if err != nil {
 		t.Fatal("there should be no error:", err)
 	}
-	defer publisher1.Close()
 
 	// Another bus to test the observer.
-	publisher2, err := NewEventPublisher("test", addr, "")
+	publisher2, err := NewEventPublisher(addr, appID, "client2")
 	if err != nil {
 		t.Fatal("there should be no error:", err)
 	}
-	defer publisher2.Close()
 
 	// Wait for subscriptions to be ready.
-	<-publisher1.ready
-	<-publisher2.ready
+	time.Sleep(time.Second)
 
 	testutil.EventPublisherCommonTests(t, publisher1, publisher2)
 }

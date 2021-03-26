@@ -18,11 +18,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
+	"strings"
 	"time"
 
-	"github.com/garyburd/redigo/redis"
-	"github.com/jpillora/backoff"
+	"github.com/go-redis/redis/v8"
 	"go.mongodb.org/mongo-driver/bson"
 
 	eh "github.com/looplab/eventhorizon"
@@ -40,73 +39,80 @@ var ErrCouldNotUnmarshalEvent = errors.New("could not unmarshal event")
 type EventPublisher struct {
 	*local.EventPublisher
 
-	prefix string
-	pool   *redis.Pool
-	conn   *redis.PubSubConn
-	ready  chan bool // NOTE: Used for testing only
-	exit   chan bool
+	streamName string
+	client     *redis.Client
+	clientOpts *redis.Options
+	errCh      chan error
 }
 
 // NewEventPublisher creates a EventPublisher for remote events.
-func NewEventPublisher(appID, server, password string) (*EventPublisher, error) {
-	pool := &redis.Pool{
-		MaxIdle:     3,
-		IdleTimeout: 240 * time.Second,
-		Dial: func() (redis.Conn, error) {
-			c, err := redis.Dial("tcp", server)
-			if err != nil {
-				return nil, err
-			}
-			if password != "" {
-				if _, err := c.Do("AUTH", password); err != nil {
-					c.Close()
-					return nil, err
-				}
-			}
-			return c, err
-		},
-		TestOnBorrow: func(c redis.Conn, t time.Time) error {
-			_, err := c.Do("PING")
-			return err
-		},
-	}
-
-	return NewEventPublisherWithPool(appID, pool)
-}
-
-// NewEventPublisherWithPool creates a EventPublisher for remote events.
-func NewEventPublisherWithPool(appID string, pool *redis.Pool) (*EventPublisher, error) {
+func NewEventPublisher(addr, appID, subscriberID string, options ...Option) (*EventPublisher, error) {
 	b := &EventPublisher{
 		EventPublisher: local.NewEventPublisher(),
-		prefix:         appID + ":events:",
-		pool:           pool,
-		ready:          make(chan bool, 1), // Buffered to not block receive loop.
-		exit:           make(chan bool),
+		streamName:     appID + "_events",
+		errCh:          make(chan error, 20),
+	}
+
+	// Apply configuration options.
+	for _, option := range options {
+		if option == nil {
+			continue
+		}
+		if err := option(b); err != nil {
+			return nil, fmt.Errorf("error while applying option: %w", err)
+		}
+	}
+
+	// Default client options.
+	if b.clientOpts == nil {
+		b.clientOpts = &redis.Options{
+			Addr: addr,
+		}
+	}
+
+	ctx := context.Background()
+
+	// Create client and check connection.
+	b.client = redis.NewClient(b.clientOpts)
+	if res, err := b.client.Ping(ctx).Result(); err != nil || res != "PONG" {
+		return nil, fmt.Errorf("could not check Redis server: %w", err)
+	}
+
+	groupName := appID + "_" + subscriberID
+	res, err := b.client.XGroupCreateMkStream(ctx, b.streamName, groupName, "$").Result()
+	if err != nil {
+		// Ignore group exists non-errors.
+		if !strings.HasPrefix(err.Error(), "BUSYGROUP") {
+			return nil, fmt.Errorf("could not create consumer group: %w", err)
+		}
+	} else if res != "OK" {
+		return nil, fmt.Errorf("could not create consumer group: %s", res)
 	}
 
 	go func() {
-		log.Println("eventpublisher: start receiving")
-		defer log.Println("eventpublisher: stop receiving")
-
-		// Used for exponential fall back on reconnects.
-		delay := &backoff.Backoff{
-			Max: 5 * time.Minute,
-		}
-
-		for {
-			if err := b.recv(delay); err != nil {
-				d := delay.Duration()
-				log.Printf("eventpublisher: receive failed, retrying in %s: %s", d, err)
-				time.Sleep(d)
-				continue
+		if err := b.recv(context.Background(), groupName); err != context.Canceled {
+			select {
+			case b.errCh <- Error{Err: errors.New("could not receive"), BaseErr: err}:
+			default:
 			}
-
-			return
 		}
 	}()
 
 	return b, nil
 }
+
+// Option is an option setter used to configure creation.
+type Option func(*EventPublisher) error
+
+// WithRedisOptions uses the Redis options for the underlying client, instead of the defaults.
+func WithRedisOptions(opts *redis.Options) Option {
+	return func(b *EventPublisher) error {
+		b.clientOpts = opts
+		return nil
+	}
+}
+
+const dataKey = "data"
 
 // PublishEvent publishes an event to all handlers capable of handling it.
 func (b *EventPublisher) PublishEvent(ctx context.Context, event eh.Event) error {
@@ -133,110 +139,124 @@ func (b *EventPublisher) PublishEvent(ctx context.Context, event eh.Event) error
 		return ErrCouldNotMarshalEvent
 	}
 
-	conn := b.pool.Get()
-	defer conn.Close()
-
-	if err := conn.Err(); err != nil {
-		return err
+	args := &redis.XAddArgs{
+		Stream: b.streamName,
+		Values: map[string]interface{}{
+			dataKey: data,
+		},
 	}
-
-	// Publish all events on their own channel.
-	if _, err = conn.Do("PUBLISH", b.prefix+string(event.EventType()), data); err != nil {
-		return err
+	if _, err := b.client.XAdd(ctx, args).Result(); err != nil {
+		return fmt.Errorf("could not publish event: %w", err)
 	}
 
 	return nil
 }
 
-// Close exits the receive goroutine by unsubscribing to all channels.
-func (b *EventPublisher) Close() error {
-	select {
-	case b.exit <- true:
-	default:
-		log.Println("eventpublisher: already closed")
-	}
-
-	return b.pool.Close()
-}
-
-func (b *EventPublisher) recv(delay *backoff.Backoff) error {
-	conn := b.pool.Get()
-	defer conn.Close()
-
-	pubSubConn := &redis.PubSubConn{Conn: conn}
-	go func() {
-		<-b.exit
-		if err := pubSubConn.PUnsubscribe(); err != nil {
-			log.Println("eventpublisher: could not unsubscribe:", err)
-		}
-		if err := pubSubConn.Close(); err != nil {
-			log.Println("eventpublisher: could not close connection:", err)
-		}
-	}()
-
-	err := pubSubConn.PSubscribe(b.prefix + "*")
-	if err != nil {
-		return err
-	}
-
+func (b *EventPublisher) recv(ctx context.Context, groupName string) error {
+	readOpt := ">"
 	for {
-		switch m := pubSubConn.Receive().(type) {
-		case redis.PMessage:
-			if err := b.handleMessage(m); err != nil {
-				log.Println("eventpublisher: error publishing:", err)
-			}
+		streams, err := b.client.XReadGroup(ctx, &redis.XReadGroupArgs{
+			Group:    groupName,
+			Consumer: groupName,
+			Streams:  []string{b.streamName, readOpt},
+		}).Result()
+		if err != nil {
+			return err
+		}
 
-		case redis.Subscription:
-			if m.Kind == "psubscribe" {
-				log.Println("eventpublisher: subscribed to:", m.Channel)
-				delay.Reset()
-
-				// Don't block if no one is receiving and buffer is full.
-				select {
-				case b.ready <- true:
-				default:
-				}
+		// Handle all messages from group read.
+		for _, stream := range streams {
+			if stream.Stream != b.streamName {
+				continue
 			}
-		case error:
-			// Don' treat connections closed by the user as errors.
-			if m.Error() == "redigo: get on closed pool" ||
-				m.Error() == "redigo: connection closed" {
-				return nil
+			for _, msg := range stream.Messages {
+				b.handleMessage(ctx, &msg, groupName)
 			}
+		}
 
-			return m
+		// Flip flop the read option to read new and non-acked messages every other time.
+		if readOpt == ">" {
+			readOpt = "0"
+		} else {
+			readOpt = ">"
 		}
 	}
 }
 
-func (b *EventPublisher) handleMessage(msg redis.PMessage) error {
+func (b *EventPublisher) handleMessage(ctx context.Context, msg *redis.XMessage, groupName string) {
+	// Ack directly after receiving the event to avoid getting retries.
+	// TODO: Figure out when to best ack/nack a message.
+	if _, err := b.client.XAck(ctx, b.streamName, groupName, msg.ID).Result(); err != nil {
+		err = fmt.Errorf("could not ack event: %w", err)
+		b.errCh <- Error{Ctx: ctx, Err: err}
+	}
+
+	data, ok := msg.Values[dataKey].(string)
+	if !ok {
+		b.errCh <- Error{Err: ErrCouldNotUnmarshalEvent}
+		return
+	}
+
 	// Decode the raw BSON event data.
 	var e redisEvent
-	if err := bson.Unmarshal(msg.Data, &e); err != nil {
-		// TODO: Forward the real error.
-		return ErrCouldNotUnmarshalEvent
+	if err := bson.Unmarshal([]byte(data), &e); err != nil {
+		select {
+		case b.errCh <- Error{Err: ErrCouldNotUnmarshalEvent, BaseErr: err}:
+		default:
+		}
+		return
 	}
 
 	// Create an event of the correct type and decode from raw BSON.
 	if len(e.RawData) > 0 {
 		var err error
 		if e.data, err = eh.CreateEventData(e.EventType); err != nil {
-			// TODO: Forward the real error.
-			return ErrCouldNotUnmarshalEvent
+			select {
+			case b.errCh <- Error{Err: ErrCouldNotUnmarshalEvent, BaseErr: fmt.Errorf("%s: %s, %s, %s", err.Error(), e.AggregateType, e.EventType, e.AggregateID)}:
+			default:
+			}
+			return
 		}
 
 		if err := bson.Unmarshal(e.RawData, e.data); err != nil {
-			// TODO: Forward the real error.
-			return ErrCouldNotUnmarshalEvent
+			select {
+			case b.errCh <- Error{Err: ErrCouldNotUnmarshalEvent, BaseErr: fmt.Errorf("%s: %s, %s, %s", err.Error(), e.AggregateType, e.EventType, e.AggregateID)}:
+			default:
+			}
+			return
 		}
 		e.RawData = nil
 	}
 
 	event := event{redisEvent: e}
-	ctx := eh.UnmarshalContext(e.Context)
+	ctx = eh.UnmarshalContext(e.Context)
 
 	// Notify all observers about the event.
-	return b.EventPublisher.PublishEvent(ctx, event)
+	if err := b.EventPublisher.PublishEvent(ctx, event); err != nil {
+		b.errCh <- Error{Ctx: ctx, Err: err, Event: event}
+		return
+	}
+}
+
+// Errors returns an error channel where async handling errors are sent.
+func (b *EventPublisher) Errors() <-chan error {
+	return b.errCh
+}
+
+// Error is an async error containing the error and the event.
+type Error struct {
+	Err     error
+	BaseErr error
+	Ctx     context.Context
+	Event   eh.Event
+}
+
+// Error implements the Error method of the error interface.
+func (e Error) Error() string {
+	if e.Event != nil {
+		return fmt.Sprintf("%s: %s (%s)", e.Event.String(), e.Err, e.BaseErr)
+	}
+	return fmt.Sprintf("%s (%s)", e.Err, e.BaseErr)
 }
 
 // redisEvent is the internal event used with the Redis event bus.
