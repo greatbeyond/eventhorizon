@@ -100,6 +100,7 @@ func NewEventPublisher(addr, appID, subscriberID string, options ...Option) (*Ev
 			select {
 			case b.errCh <- Error{Err: errors.New("could not receive"), BaseErr: err}:
 			default:
+				fmt.Printf("eventhorizon: could not log receive error: %s", err)
 			}
 		}
 	}()
@@ -215,29 +216,20 @@ func (b *EventPublisher) handleMessage(ctx context.Context, msg *redis.XMessage,
 	// Ack directly after receiving the event to avoid getting retries.
 	// TODO: Figure out when to best ack/nack a message.
 	if _, err := b.client.XAck(ctx, b.streamName, groupName, msg.ID).Result(); err != nil {
-		select {
-		case b.errCh <- Error{Err: fmt.Errorf("could not ack event: %w", err)}:
-		default:
-		}
+		b.sendError(Error{Err: fmt.Errorf("could not ack event: %w", err)})
 		return
 	}
 
 	data, ok := msg.Values[dataKey].(string)
 	if !ok {
-		select {
-		case b.errCh <- Error{Err: ErrCouldNotUnmarshalEvent}:
-		default:
-		}
+		b.sendError(Error{Err: ErrCouldNotUnmarshalEvent})
 		return
 	}
 
 	// Decode the raw BSON event data.
 	var e redisEvent
 	if err := bson.Unmarshal([]byte(data), &e); err != nil {
-		select {
-		case b.errCh <- Error{Err: ErrCouldNotUnmarshalEvent, BaseErr: err}:
-		default:
-		}
+		b.sendError(Error{Err: ErrCouldNotUnmarshalEvent, BaseErr: err})
 		return
 	}
 
@@ -245,18 +237,18 @@ func (b *EventPublisher) handleMessage(ctx context.Context, msg *redis.XMessage,
 	if len(e.RawData) > 0 {
 		var err error
 		if e.data, err = eh.CreateEventData(e.EventType); err != nil {
-			select {
-			case b.errCh <- Error{Err: ErrCouldNotUnmarshalEvent, BaseErr: fmt.Errorf("%s: %s, %s, %s", err.Error(), e.AggregateType, e.EventType, e.AggregateID)}:
-			default:
-			}
+			b.sendError(Error{
+				Err:     ErrCouldNotUnmarshalEvent,
+				BaseErr: fmt.Errorf("%s: %s, %s, %s", err.Error(), e.AggregateType, e.EventType, e.AggregateID),
+			})
 			return
 		}
 
 		if err := bson.Unmarshal(e.RawData, e.data); err != nil {
-			select {
-			case b.errCh <- Error{Err: ErrCouldNotUnmarshalEvent, BaseErr: fmt.Errorf("%s: %s, %s, %s", err.Error(), e.AggregateType, e.EventType, e.AggregateID)}:
-			default:
-			}
+			b.sendError(Error{
+				Err:     ErrCouldNotUnmarshalEvent,
+				BaseErr: fmt.Errorf("%s: %s, %s, %s", err.Error(), e.AggregateType, e.EventType, e.AggregateID),
+			})
 			return
 		}
 		e.RawData = nil
@@ -267,11 +259,16 @@ func (b *EventPublisher) handleMessage(ctx context.Context, msg *redis.XMessage,
 
 	// Notify all observers about the event.
 	if err := b.EventPublisher.PublishEvent(ctx, event); err != nil {
-		select {
-		case b.errCh <- Error{Ctx: ctx, Err: err, Event: event}:
-		default:
-		}
+		b.sendError(Error{Ctx: ctx, Err: err, Event: event})
 		return
+	}
+}
+
+func (b *EventPublisher) sendError(err error) {
+	select {
+	case b.errCh <- err:
+	default:
+		fmt.Printf("eventhorizon: could not log error: %s", err)
 	}
 }
 

@@ -92,6 +92,7 @@ func NewEventPublisher(projectID, appID, subscriberID string) (*EventPublisher, 
 				select {
 				case b.errCh <- Error{Err: errors.New("could not receive"), BaseErr: err}:
 				default:
+					fmt.Printf("eventhorizon: could not log receive error: %s", err)
 				}
 			}
 		}
@@ -143,10 +144,7 @@ func (b *EventPublisher) handleMessage(ctx context.Context, msg *pubsub.Message)
 	// Manually decode the raw BSON event.
 	var e gcpEvent
 	if err := bson.Unmarshal(msg.Data, &e); err != nil {
-		select {
-		case b.errCh <- Error{Err: ErrCouldNotUnmarshalEvent, BaseErr: err}:
-		default:
-		}
+		b.sendError(Error{Err: ErrCouldNotUnmarshalEvent, BaseErr: err})
 		return
 	}
 
@@ -155,18 +153,18 @@ func (b *EventPublisher) handleMessage(ctx context.Context, msg *pubsub.Message)
 		var err error
 		e.data, err = eh.CreateEventData(e.EventType)
 		if err != nil {
-			select {
-			case b.errCh <- Error{Err: ErrCouldNotUnmarshalEvent, BaseErr: fmt.Errorf("%s: %s, %s, %s", err.Error(), e.AggregateType, e.EventType, e.AggregateID)}:
-			default:
-			}
+			b.sendError(Error{
+				Err:     ErrCouldNotUnmarshalEvent,
+				BaseErr: fmt.Errorf("%s: %s, %s, %s", err.Error(), e.AggregateType, e.EventType, e.AggregateID),
+			})
 			return
 		}
 
 		if err := bson.Unmarshal(e.RawData, e.data); err != nil {
-			select {
-			case b.errCh <- Error{Err: ErrCouldNotUnmarshalEvent, BaseErr: fmt.Errorf("%s: %s, %s, %s", err.Error(), e.AggregateType, e.EventType, e.AggregateID)}:
-			default:
-			}
+			b.sendError(Error{
+				Err:     ErrCouldNotUnmarshalEvent,
+				BaseErr: fmt.Errorf("%s: %s, %s, %s", err.Error(), e.AggregateType, e.EventType, e.AggregateID),
+			})
 			return
 		}
 		e.RawData = nil
@@ -177,11 +175,15 @@ func (b *EventPublisher) handleMessage(ctx context.Context, msg *pubsub.Message)
 
 	// Notify all observers about the event.
 	if err := b.EventPublisher.PublishEvent(ctx, event); err != nil {
-		// Try to publish the error (currently there exist no errors at all).
-		select {
-		case b.errCh <- Error{Ctx: ctx, Err: err, Event: event}:
-		default:
-		}
+		b.sendError(Error{Ctx: ctx, Err: err, Event: event})
+	}
+}
+
+func (b *EventPublisher) sendError(err error) {
+	select {
+	case b.errCh <- err:
+	default:
+		fmt.Printf("eventhorizon: could not log error: %s", err)
 	}
 }
 
