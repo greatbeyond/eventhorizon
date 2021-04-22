@@ -18,7 +18,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-redis/redis/v8"
@@ -39,10 +41,12 @@ var ErrCouldNotUnmarshalEvent = errors.New("could not unmarshal event")
 type EventPublisher struct {
 	*local.EventPublisher
 
-	streamName string
-	client     *redis.Client
-	clientOpts *redis.Options
-	errCh      chan error
+	streamName  string
+	client      *redis.Client
+	clientOpts  *redis.Options
+	errCh       chan error
+	parallel    int
+	ackDeadline time.Duration
 }
 
 // NewEventPublisher creates a EventPublisher for remote events.
@@ -51,6 +55,8 @@ func NewEventPublisher(addr, appID, subscriberID string, options ...Option) (*Ev
 		EventPublisher: local.NewEventPublisher(),
 		streamName:     appID + "_events",
 		errCh:          make(chan error, 20),
+		parallel:       10,
+		ackDeadline:    60 * time.Second,
 	}
 
 	// Apply configuration options.
@@ -153,6 +159,20 @@ func (b *EventPublisher) PublishEvent(ctx context.Context, event eh.Event) error
 }
 
 func (b *EventPublisher) recv(ctx context.Context, groupName string) error {
+	queue := make(chan *redis.XMessage)
+	wg := sync.WaitGroup{}
+	for i := 0; i < b.parallel; i++ {
+		wg.Add(1)
+		go func(ch <-chan *redis.XMessage) {
+			for msg := range ch {
+				// TODO: Maybe add ack deadline timeout here. Send to nack channel.
+				b.handleMessage(ctx, msg, groupName)
+			}
+			wg.Done()
+		}(queue)
+	}
+	// TODO: Close queue and wait for goroutines to close.
+
 	readOpt := ">"
 	for {
 		streams, err := b.client.XReadGroup(ctx, &redis.XReadGroupArgs{
@@ -164,14 +184,22 @@ func (b *EventPublisher) recv(ctx context.Context, groupName string) error {
 			return err
 		}
 
+		// Check resulting streams to match our single stream.
+		if len(streams) != 1 || streams[0].Stream != b.streamName {
+			continue
+		}
+		stream := streams[0]
+
 		// Handle all messages from group read.
-		for _, stream := range streams {
-			if stream.Stream != b.streamName {
+		for _, msg := range stream.Messages {
+			publishTime := timeFromRedisID(msg.ID)
+			if readOpt == "0" && publishTime.After(time.Now().Add(-b.ackDeadline)) {
+				// Ignore messages which have not yet reach their ack deadline.
 				continue
 			}
-			for _, msg := range stream.Messages {
-				b.handleMessage(ctx, &msg, groupName)
-			}
+
+			// Block until previous messages are handeled.
+			queue <- &msg
 		}
 
 		// Flip flop the read option to read new and non-acked messages every other time.
@@ -187,13 +215,19 @@ func (b *EventPublisher) handleMessage(ctx context.Context, msg *redis.XMessage,
 	// Ack directly after receiving the event to avoid getting retries.
 	// TODO: Figure out when to best ack/nack a message.
 	if _, err := b.client.XAck(ctx, b.streamName, groupName, msg.ID).Result(); err != nil {
-		err = fmt.Errorf("could not ack event: %w", err)
-		b.errCh <- Error{Ctx: ctx, Err: err}
+		select {
+		case b.errCh <- Error{Err: fmt.Errorf("could not ack event: %w", err)}:
+		default:
+		}
+		return
 	}
 
 	data, ok := msg.Values[dataKey].(string)
 	if !ok {
-		b.errCh <- Error{Err: ErrCouldNotUnmarshalEvent}
+		select {
+		case b.errCh <- Error{Err: ErrCouldNotUnmarshalEvent}:
+		default:
+		}
 		return
 	}
 
@@ -233,7 +267,10 @@ func (b *EventPublisher) handleMessage(ctx context.Context, msg *redis.XMessage,
 
 	// Notify all observers about the event.
 	if err := b.EventPublisher.PublishEvent(ctx, event); err != nil {
-		b.errCh <- Error{Ctx: ctx, Err: err, Event: event}
+		select {
+		case b.errCh <- Error{Ctx: ctx, Err: err, Event: event}:
+		default:
+		}
 		return
 	}
 }
@@ -310,4 +347,24 @@ func (e event) Version() int {
 // String implements the String method of the eventhorizon.Event interface.
 func (e event) String() string {
 	return fmt.Sprintf("%s@%d", e.redisEvent.EventType, e.redisEvent.Version)
+}
+
+// Converts a Redis message ID in format "1526919030474-55" to time.Time.
+// Both quantities are 64-bit numbers. When an ID is auto-generated, the first
+// part is the Unix time in milliseconds of the Redis instance generating the ID.
+// The second part is just a sequence number and is used in order to distinguish
+// IDs generated in the same millisecond.
+// See: https://redis.io/commands/xadd#specifying-a-stream-id-as-an-argument
+func timeFromRedisID(id string) time.Time {
+	parts := strings.Split(id, "-")
+	if len(parts) == 0 {
+		return time.Time{}
+	}
+	ms, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return time.Time{}
+	}
+	s := int64(ms) / 1e3
+	ns := (int64(ms) - s*1e3) * 1e6
+	return time.Unix(s, ns)
 }
