@@ -108,6 +108,9 @@ func (e *EventStoreError) Error() string {
 	if len(e.Events) > 0 {
 		var es []string
 		for _, ev := range e.Events {
+
+			// @TODO remove this comment, and the above/after empty lines when we know this code is actually run in production
+
 			if ev != nil {
 				es = append(es, ev.String())
 			} else {
