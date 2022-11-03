@@ -113,6 +113,10 @@ func (s *EventStore) Close() error {
 	return nil
 }
 
+func (s *EventStore) ForNamespace(ctx context.Context) (eh.EventStore, error) {
+	return s.eventStore(ctx)
+}
+
 // eventStore is a helper that returns or creates event stores for each namespace.
 func (s *EventStore) eventStore(ctx context.Context) (eh.EventStore, error) {
 	ns := FromContext(ctx)
